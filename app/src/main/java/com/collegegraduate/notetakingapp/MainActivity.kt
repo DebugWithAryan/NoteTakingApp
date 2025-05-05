@@ -1,5 +1,6 @@
 package com.collegegraduate.notetakingapp
 
+import android.app.Application
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -25,29 +26,58 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.room.*
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
 import java.util.*
+
+// Application class to initialize database
+class NotesApplication : Application() {
+    val database: NoteDatabase by lazy { NoteDatabase.getDatabase(this) }
+}
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent {
             NotesAppTheme {
-                NotesApp()
+                val app = application as NotesApplication
+                val notesViewModel: NotesViewModel = viewModel(
+                    factory = NotesViewModelFactory(app)
+                )
+                NotesApp(notesViewModel)
             }
         }
     }
 }
+
+// Room Database Setup
+@Entity(tableName = "notes")
+data class NoteEntity(
+    @PrimaryKey val id: String = UUID.randomUUID().toString(),
+    val title: String,
+    val content: String,
+    val timestamp: Long = System.currentTimeMillis(),
+    val colorInt: Int,
+    val isPinned: Boolean = false
+)
 
 data class Note(
     val id: UUID = UUID.randomUUID(),
@@ -56,7 +86,31 @@ data class Note(
     val timestamp: Long = System.currentTimeMillis(),
     val color: Color = noteColors.random(),
     val isPinned: Boolean = false
-)
+) {
+    fun toEntity(): NoteEntity {
+        return NoteEntity(
+            id = id.toString(),
+            title = title,
+            content = content,
+            timestamp = timestamp,
+            colorInt = color.toArgb(),
+            isPinned = isPinned
+        )
+    }
+
+    companion object {
+        fun fromEntity(entity: NoteEntity): Note {
+            return Note(
+                id = UUID.fromString(entity.id),
+                title = entity.title,
+                content = entity.content,
+                timestamp = entity.timestamp,
+                color = Color(entity.colorInt),
+                isPinned = entity.isPinned
+            )
+        }
+    }
+}
 
 val noteColors = listOf(
     Color(0xFF1E1E2C),
@@ -66,50 +120,126 @@ val noteColors = listOf(
     Color(0xFF202030)
 )
 
-class NotesViewModel : ViewModel() {
-    var notes = mutableStateListOf<Note>()
-        private set
+@Dao
+interface NoteDao {
+    @Query("SELECT * FROM notes ORDER BY isPinned DESC, timestamp DESC")
+    fun getAllNotes(): Flow<List<NoteEntity>>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insert(note: NoteEntity)
+
+    @Update
+    suspend fun update(note: NoteEntity)
+
+    @Delete
+    suspend fun delete(note: NoteEntity)
+
+    @Query("SELECT COUNT(*) FROM notes")
+    suspend fun count(): Int
+}
+
+@Database(entities = [NoteEntity::class], version = 1, exportSchema = false)
+abstract class NoteDatabase : RoomDatabase() {
+    abstract fun noteDao(): NoteDao
+
+    companion object {
+        @Volatile
+        private var INSTANCE: NoteDatabase? = null
+
+        fun getDatabase(context: Application): NoteDatabase {
+            return INSTANCE ?: synchronized(this) {
+                val instance = Room.databaseBuilder(
+                    context.applicationContext,
+                    NoteDatabase::class.java,
+                    "note_database"
+                ).build()
+                INSTANCE = instance
+                instance
+            }
+        }
+    }
+}
+
+class NotesViewModel(application: Application) : AndroidViewModel(application) {
+    private val noteDao = (application as NotesApplication).database.noteDao()
+    private val _notes = mutableStateListOf<Note>()
+    val notes: List<Note> get() = _notes
 
     init {
-        notes.add(Note(title = "Welcome to Notes App", content = "This is a feature-rich notes app built with Jetpack Compose. Tap on a note to view or edit it."))
+        // Load notes from database
+        viewModelScope.launch {
+            noteDao.getAllNotes().collect { entities ->
+                _notes.clear()
+                _notes.addAll(entities.map { Note.fromEntity(it) })
 
+                // Add sample notes if empty (only on first launch)
+                if (entities.isEmpty()) {
+                    addInitialNotes()
+                }
+            }
+        }
+    }
+
+    private suspend fun addInitialNotes() {
+        val welcomeNote = Note(
+            title = "Welcome to Notes App",
+            content = "This is a feature-rich notes app built with Jetpack Compose. Tap on a note to view or edit it."
+        )
+        noteDao.insert(welcomeNote.toEntity())
+
+        val shoppingNote = Note(
+            title = "Shopping List",
+            content = "- Milk\n- Eggs\n- Bread\n- Fruits\n- Vegetables"
+        )
+        noteDao.insert(shoppingNote.toEntity())
+
+        val projectNote = Note(
+            title = "Project Ideas",
+            content = "1. Build a weather app\n2. Create a recipe manager\n3. Design a budget tracker"
+        )
+        noteDao.insert(projectNote.toEntity())
     }
 
     fun addNote(title: String, content: String) {
-        notes.add(0, Note(title = title, content = content))
+        val newNote = Note(title = title, content = content)
+        viewModelScope.launch {
+            noteDao.insert(newNote.toEntity())
+        }
     }
 
     fun updateNote(updatedNote: Note) {
-        val index = notes.indexOfFirst { it.id == updatedNote.id }
-        if (index != -1) {
-            notes[index] = updatedNote
+        viewModelScope.launch {
+            noteDao.update(updatedNote.toEntity())
         }
     }
 
     fun deleteNote(note: Note) {
-        notes.remove(note)
-    }
-
-    fun togglePinStatus(note: Note) {
-        val index = notes.indexOfFirst { it.id == note.id }
-        if (index != -1) {
-            val updatedNote = note.copy(isPinned = !note.isPinned)
-            notes[index] = updatedNote
-
-            notes.sortWith(compareByDescending<Note> { it.isPinned }.thenByDescending { it.timestamp })
+        viewModelScope.launch {
+            noteDao.delete(note.toEntity())
         }
     }
 
-    fun reorderNotes() {
-        val notesList = notes.toList()
-        notes.clear()
-        notes.addAll(notesList.sortedWith(compareByDescending<Note> { it.isPinned }.thenByDescending { it.timestamp }))
+    fun togglePinStatus(note: Note) {
+        val updatedNote = note.copy(isPinned = !note.isPinned)
+        viewModelScope.launch {
+            noteDao.update(updatedNote.toEntity())
+        }
+    }
+}
+
+class NotesViewModelFactory(private val application: Application) : ViewModelProvider.Factory {
+    override fun <T : ViewModel> create(modelClass: Class<T>): T {
+        if (modelClass.isAssignableFrom(NotesViewModel::class.java)) {
+            @Suppress("UNCHECKED_CAST")
+            return NotesViewModel(application) as T
+        }
+        throw IllegalArgumentException("Unknown ViewModel class")
     }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun NotesApp(notesViewModel: NotesViewModel = viewModel()) {
+fun NotesApp(notesViewModel: NotesViewModel) {
     val notes = notesViewModel.notes
     var selectedNote by remember { mutableStateOf<Note?>(null) }
     var isAddingNote by remember { mutableStateOf(false) }
@@ -117,10 +247,6 @@ fun NotesApp(notesViewModel: NotesViewModel = viewModel()) {
     var isSearching by remember { mutableStateOf(false) }
     val snackbarHostState = remember { SnackbarHostState() }
     val coroutineScope = rememberCoroutineScope()
-
-    LaunchedEffect(Unit) {
-        notesViewModel.reorderNotes()
-    }
 
     val filteredNotes = if (searchQuery.isEmpty()) {
         notes
@@ -183,7 +309,7 @@ fun NotesApp(notesViewModel: NotesViewModel = viewModel()) {
         snackbarHost = { SnackbarHost(snackbarHostState) }
     ) { padding ->
         Box(modifier = Modifier.padding(padding)) {
-
+            // Note list
             if (filteredNotes.isEmpty()) {
                 Box(
                     modifier = Modifier.fillMaxSize(),
@@ -224,6 +350,7 @@ fun NotesApp(notesViewModel: NotesViewModel = viewModel()) {
                 }
             }
 
+            // Add/Edit Note dialog
             AnimatedVisibility(
                 visible = isAddingNote || selectedNote != null,
                 enter = slideInVertically(initialOffsetY = { it }) + fadeIn(),
@@ -306,7 +433,7 @@ fun NoteCard(
                 onLongClick = {
                     longPressDetected = true
                     coroutineScope.launch {
-                        delay(800)
+                        delay(800)  // Show options after a short delay
                         if (longPressDetected) {
                             onLongPress()
                         }
@@ -373,6 +500,7 @@ fun NoteCard(
                     color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
                 )
 
+                // Delete icon button
                 IconButton(
                     onClick = { showDeleteConfirmation = true },
                     modifier = Modifier.size(24.dp)
@@ -455,6 +583,7 @@ fun NoteDialog(
 
                 Row {
                     if (isEditMode) {
+                        // Pin toggle
                         IconButton(onClick = onTogglePin) {
                             Icon(
                                 if (note?.isPinned == true) Icons.Default.PushPin else Icons.Filled.PushPin,
@@ -463,6 +592,7 @@ fun NoteDialog(
                             )
                         }
 
+                        // Delete button
                         IconButton(onClick = { showDeleteConfirmation = true }) {
                             Icon(
                                 Icons.Default.Delete,
@@ -486,6 +616,7 @@ fun NoteDialog(
                 }
             }
 
+            // Title field
             TextField(
                 value = title,
                 onValueChange = { title = it },
@@ -504,6 +635,7 @@ fun NoteDialog(
 
             Spacer(modifier = Modifier.height(8.dp))
 
+            // Content field
             TextField(
                 value = content,
                 onValueChange = { content = it },
